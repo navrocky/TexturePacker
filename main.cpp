@@ -16,10 +16,57 @@ struct Texture
 {
     QString fileName;
     QImage image;
+    QSize origImageSize;
+    QPoint offset;
 };
 
+QRect getImageRect(const QImage& img)
+{
+    QRect res(-1, -1, 0, 0);
 
-void packTextures(const QStringList& fileNames, const QString& outputName)
+    for (int i = 0; i < img.height(); i++)
+    {
+        int left = -1;
+        int right = -1;
+        const QRgb* rgb = reinterpret_cast<const QRgb*>(img.scanLine(i));
+        for (int j = 0; j < img.width(); j++)
+        {
+            if (qAlpha(*rgb) > 0)
+            {
+                if (left == -1)
+                    left = j;
+                right = j;
+            }
+            rgb++;
+        }
+
+        qDebug() << i << left << right;
+
+        bool isEmptyLine = left == -1;
+
+        if (left >= 0)
+        {
+            if (res.left() == -1)
+                res.setLeft(left);
+            else
+                res.setLeft(qMin(left, res.left()));
+        }
+
+        if (right >= 0)
+            res.setRight(qMax(right, res.right()));
+
+        if (!isEmptyLine)
+        {
+            if (res.top() == -1)
+                res.setTop(i);
+            res.setBottom(i);
+        }
+    }
+    return res;
+}
+
+
+void packTextures(const QStringList& fileNames, const QString& outputName, bool crop)
 {
     QString mapFileName = outputName + ".png";
     QString plistFileName = outputName + ".plist";
@@ -32,16 +79,34 @@ void packTextures(const QStringList& fileNames, const QString& outputName)
             continue;
 
         qDebug() << "Load texture from" << s;
-        Texture t;
-        t.image = QImage(s);
-
-        if (t.image.isNull())
+        QImage img(s);
+        if (img.isNull())
         {
             qDebug() << "Cant load from" << s;
             continue;
         }
+        img.convertToFormat(QImage::Format_ARGB32);
 
+        Texture t;
         t.fileName = s;
+        t.origImageSize = img.size();
+
+        if (crop)
+        {
+            QRect r = getImageRect(img);
+            QImage img2(r.size(), QImage::Format_ARGB32);
+            img2.fill(Qt::transparent);
+            QPainter p(&img2);
+            p.drawImage(QPoint(0, 0), img, r);
+            t.image = img2;
+            t.offset = r.topLeft();
+        }
+        else
+        {
+            t.image = img;
+            t.offset = QPoint(0, 0);
+        }
+
         textures << t;
     }
 
@@ -51,7 +116,7 @@ void packTextures(const QStringList& fileNames, const QString& outputName)
     TEXTURE_PACKER::TexturePacker *packer = 0;
     while (true)
     {
-        qDebug() << "Pack for texture size" << width;
+        qDebug() << "Try to pack for texture size" << width;
         packer = TEXTURE_PACKER::createTexturePacker();
         packer->setTextureCount(textures.size());
         foreach (const Texture& t, textures)
@@ -98,20 +163,30 @@ void packTextures(const QStringList& fileNames, const QString& outputName)
             std::swap(w, h);
         }
 
-        plistWriter.writeTextElement("key", textures[i].fileName);
+        const Texture& t = textures[i];
+
+        plistWriter.writeTextElement("key", QFileInfo(t.fileName).fileName());
         plistWriter.writeStartElement("dict");
 
         plistWriter.writeTextElement("key", "frame");
         plistWriter.writeTextElement("string", QString("{{%1,%2},{%3,%4}}").arg(x).arg(y).arg(w).arg(h));
         plistWriter.writeTextElement("key", "offset");
-        plistWriter.writeTextElement("string", "{0,0}");
+        plistWriter.writeTextElement("string", QString("{%1,%2}")
+                                     .arg(t.offset.x() - (t.origImageSize.width() - t.image.width()) / 2)
+                                     .arg(t.offset.y() - (t.origImageSize.height() - t.image.height())/ 2)
+                                     );
         plistWriter.writeTextElement("key", "rotated");
         if (rotated)
             plistWriter.writeEmptyElement("true");
         else
             plistWriter.writeEmptyElement("false");
+        plistWriter.writeTextElement("key", "sourceColorRect");
+        plistWriter.writeTextElement("string", QString("{{%1,%2},{%3,%4}}").arg(t.offset.x()).arg(t.offset.y())
+                                     .arg(t.image.width()).arg(t.image.height()));
         plistWriter.writeTextElement("key", "sourceSize");
-        plistWriter.writeTextElement("string", QString("{%1,%2}").arg(w).arg(h));
+                plistWriter.writeTextElement("string", QString("{%1,%2}")
+                                             .arg(t.origImageSize.width())
+                                             .arg(t.origImageSize.height()));
 
         plistWriter.writeEndElement();
 
@@ -161,10 +236,41 @@ void packTextures(const QStringList& fileNames, const QString& outputName)
     TEXTURE_PACKER::releaseTexturePacker(packer);
 }
 
-int main()
+int main(int argc, char** argv)
 {
-    QDir d;
-    packTextures(d.entryList(), "map");
+    QCoreApplication app(argc, argv);
+    QCoreApplication::setApplicationName("Texture packer");
+    QCoreApplication::setApplicationVersion("1.0");
+
+    QCommandLineParser parser;
+    parser.setApplicationDescription("Packs some images to single texture atlas");
+    parser.addHelpOption();
+    parser.addVersionOption();
+    parser.addPositionalArgument("source", QCoreApplication::translate("main", "Source image files"));
+
+    QCommandLineOption outputNameOption(QStringList() << "O" << "output",
+                                             QCoreApplication::translate("main", "Creates texture atlas with the specified <name> in current directory. Default name is \"map\""),
+                                             QCoreApplication::translate("main", "name"));
+    parser.addOption(outputNameOption);
+    QCommandLineOption cropEmptyOption(QStringList() << "C" << "crop",
+                                        QCoreApplication::translate("main", "Crops empty spaces in textures"));
+    parser.addOption(cropEmptyOption);
+
+    parser.process(app);
+
+    QString mapName = parser.value("output");
+    if (mapName.isEmpty())
+        mapName = "map";
+
+    const QStringList inFiles = parser.positionalArguments();
+    if (inFiles.isEmpty())
+    {
+        qCritical() << "You must specify some image files to pack.\n";
+        parser.showHelp();
+        return 1;
+    }
+
+    packTextures(inFiles, mapName, parser.isSet("crop"));
     return 0;
 }
 
